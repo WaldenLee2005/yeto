@@ -132,6 +132,8 @@ delta correction, q4 wire format, snapshots, resilience.
 for 1T-class MoE).
 [docs/MLX.md](docs/MLX.md) — the Apple-silicon island backend: Macs as
 learner islands (`yeto launch --external-learners`, cross Mac↔NVIDIA runs).
+[docs/PERFORMANCE_2604.md](docs/PERFORMANCE_2604.md) — performance checks
+for Decoupled DiLoCo's arXiv 2604.21428 claims.
 
 ## Testing
 

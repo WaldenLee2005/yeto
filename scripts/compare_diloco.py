@@ -44,8 +44,9 @@ yeto.learner processes over localhost TCP.
     python scripts/compare_diloco.py --model lfm25-230m --data chat.jsonl \
         --token-budget 500000 --settings m2,q4,alpha0 --device cpu
 
-Report: eval loss/token per arm + delta vs baseline, written to
---report-dir (report.md + results.jsonl) and printed.
+Report: eval loss/token per arm + delta vs baseline, plus syncer event-tape
+system metrics for DiLoCo arms, written to --report-dir (report.md +
+results.jsonl) and printed.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import shutil
 import socket
 import subprocess
@@ -241,6 +243,95 @@ def split_data(data: str, work: Path, eval_rows: int, max_rows: int | None) -> t
     dump(train, range(n - eval_rows))
     dump(evalf, range(n - eval_rows, n))
     return train, evalf, n - eval_rows
+
+
+def _pctile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    idx = min(len(values) - 1, max(0, math.ceil(q * len(values)) - 1))
+    return values[idx]
+
+
+def summarize_tape(path: Path, learners: int, wall_s: float) -> dict:
+    """Summarize system metrics from a syncer event tape.
+
+    Newer tapes include expected/responded/missed_grace/quorum_ms/grace_ms/
+    sync_ms. Older tapes only include responders and round ms; report what can
+    be inferred and leave missing timing fields as None.
+    """
+    if not path.exists():
+        return {}
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    if not records:
+        return {"rounds": 0}
+
+    round_ms = [float(r.get("ms", 0.0)) for r in records]
+    responder_counts = [len(r.get("responders") or []) for r in records]
+    full_rounds = sum(1 for n in responder_counts if n >= learners)
+    missed = 0
+    contributions: dict[int, dict[str, float]] = {}
+    quorum_ms, grace_ms, sync_ms = [], [], []
+
+    for rec in records:
+        responders = rec.get("responders") or []
+        responded = {int(r["id"]) for r in responders if "id" in r}
+        if rec.get("missed_grace") is not None:
+            missed += len(rec.get("missed_grace") or [])
+        elif rec.get("expected"):
+            missed += len({int(x) for x in rec["expected"]} - responded)
+        for key, out in (("quorum_ms", quorum_ms), ("grace_ms", grace_ms), ("sync_ms", sync_ms)):
+            if rec.get(key) is not None:
+                out.append(float(rec[key]))
+        for row in responders:
+            learner_id = int(row["id"])
+            slot = contributions.setdefault(
+                learner_id, {"responses": 0.0, "tokens": 0.0, "steps": 0.0, "weight": 0.0}
+            )
+            slot["responses"] += 1
+            slot["tokens"] += float(row.get("c_tokens", 0.0))
+            slot["steps"] += float(row.get("c_steps", 0.0))
+            slot["weight"] += float(row.get("weight", 0.0))
+
+    total_weight = sum(v["weight"] for v in contributions.values())
+    total_tokens = sum(v["tokens"] for v in contributions.values())
+    total_steps = sum(v["steps"] for v in contributions.values())
+    by_node = {}
+    for learner_id, row in sorted(contributions.items()):
+        by_node[str(learner_id)] = {
+            "responses": int(row["responses"]),
+            "tokens": int(row["tokens"]),
+            "steps": int(row["steps"]),
+            "contribution_pct": 100.0 * row["weight"] / total_weight if total_weight > 0 else 0.0,
+        }
+
+    participation = sum(responder_counts) / max(len(records) * learners, 1)
+    return {
+        "rounds": len(records),
+        "full_rounds": full_rounds,
+        "missed_grace": missed,
+        "participation_pct": 100.0 * participation,
+        "avg_responders": statistics.mean(responder_counts),
+        "avg_round_ms": statistics.mean(round_ms),
+        "p95_round_ms": _pctile(round_ms, 0.95),
+        "avg_quorum_ms": statistics.mean(quorum_ms) if quorum_ms else None,
+        "avg_grace_ms": statistics.mean(grace_ms) if grace_ms else None,
+        "avg_sync_ms": statistics.mean(sync_ms) if sync_ms else None,
+        "tokens_per_s": total_tokens / wall_s if wall_s > 0 else 0.0,
+        "steps_per_s": total_steps / wall_s if wall_s > 0 else 0.0,
+        "by_node": by_node,
+    }
+
+
+def _fmt_metric(value, suffix: str = "", digits: int = 1) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{digits}f}{suffix}"
 
 
 def eval_loss_per_token(model_id: str, adapter_dir: Path | None, eval_file: Path,
@@ -539,8 +630,9 @@ def main() -> int:
     for arm in arms:
         adapters, wall = run_diloco(args, arm, args.work_dir)
         loss = eval_in_subprocess(args, adapters, evalf)
+        system = summarize_tape(args.work_dir / arm.name / "tape.jsonl", arm.m, wall)
         records.append({"arm": arm.name, "m": arm.m, "wall_s": round(wall, 1),
-                        "eval_loss": loss})
+                        "eval_loss": loss, "system": system})
         print(f"[compare] {arm.name} eval loss/token: {loss:.4f} ({wall:.0f}s)", flush=True)
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
@@ -560,6 +652,40 @@ def main() -> int:
         )
         md.append(f"| {r['arm']} | {r['m'] or '—'} | {r['wall_s']:.0f} "
                   f"| {r['eval_loss']:.4f} | {delta} |")
+    system_rows = [r for r in records if r.get("system")]
+    if system_rows:
+        md += [
+            "",
+            "## Syncer event-tape metrics",
+            "",
+            "| arm | rounds | full quorum | missed grace | participation | avg responders | "
+            "avg round ms | p95 round ms | avg quorum ms | avg grace ms | avg sync ms | tokens/s | steps/s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for r in system_rows:
+            s = r["system"]
+            md.append(
+                f"| {r['arm']} | {s.get('rounds', 0)} | {s.get('full_rounds', 0)} | "
+                f"{s.get('missed_grace', 0)} | {_fmt_metric(s.get('participation_pct'), '%')} | "
+                f"{_fmt_metric(s.get('avg_responders'))} | "
+                f"{_fmt_metric(s.get('avg_round_ms'))} | {_fmt_metric(s.get('p95_round_ms'))} | "
+                f"{_fmt_metric(s.get('avg_quorum_ms'))} | {_fmt_metric(s.get('avg_grace_ms'))} | "
+                f"{_fmt_metric(s.get('avg_sync_ms'))} | {_fmt_metric(s.get('tokens_per_s'))} | "
+                f"{_fmt_metric(s.get('steps_per_s'))} |"
+            )
+        md += [
+            "",
+            "## Per-node contribution",
+            "",
+            "| arm | node | responses | tokens | steps | contribution |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for r in system_rows:
+            for node, row in (r["system"].get("by_node") or {}).items():
+                md.append(
+                    f"| {r['arm']} | {node} | {row['responses']} | {row['tokens']} | "
+                    f"{row['steps']} | {_fmt_metric(row['contribution_pct'], '%')} |"
+                )
     (args.report_dir / "report.md").write_text("\n".join(md) + "\n")
     print("\n".join(md))
     return 0

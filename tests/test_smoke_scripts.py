@@ -74,10 +74,14 @@ def test_launch_command_uses_auto_planner():
 def test_compare_presets_cover_the_paper_axes():
     arms = compare.select_arms("all")
     names = {a.name for a in arms}
-    assert {"m2", "m4", "alpha0", "q4", "serial", "noheloco", "strided"} <= names
+    assert {
+        "m2", "m4", "m2h24", "alpha0", "q4", "serial", "noheloco",
+        "strided", "avg",
+    } <= names
     assert compare.PRESETS["alpha0"].merge_alpha == 0.0
     assert compare.PRESETS["serial"].pipeline == 1
     assert compare.PRESETS["q4"].wire_dtype == "q4"
+    assert compare.PRESETS["m2h24"].sync_interval_steps == 24.0
 
 
 def test_token_budget_split_is_fair_across_learners():
@@ -139,3 +143,57 @@ def test_syncer_command_quorum_defaults_to_all_learners():
     assert cmd[cmd.index("--sync-interval-steps") + 1] == "0.0"
     h24 = compare.syncer_command(compare.PRESETS["m2h24"], 1, Path("/tmp/w/h"), total_steps=1)
     assert h24[h24.index("--sync-interval-steps") + 1] == "24.0"
+
+
+def test_tape_summary_reports_paper_system_metrics(tmp_path):
+    tape = tmp_path / "tape.jsonl"
+    tape.write_text(
+        "\n".join([
+            (
+                '{"step":1,"fragment":0,"ms":100,"expected":[0,1],'
+                '"responded":[0,1],"missed_grace":[],"quorum_ms":20,'
+                '"grace_ms":30,"sync_ms":10,"responders":['
+                '{"id":0,"c_steps":2,"c_tokens":20,"weight":200},'
+                '{"id":1,"c_steps":2,"c_tokens":20,"weight":200}]}'
+            ),
+            (
+                '{"step":2,"fragment":1,"ms":200,"expected":[0,1],'
+                '"responded":[0],"missed_grace":[1],"quorum_ms":40,'
+                '"grace_ms":50,"sync_ms":20,"responders":['
+                '{"id":0,"c_steps":4,"c_tokens":40,"weight":400}]}'
+            ),
+        ])
+        + "\n"
+    )
+
+    summary = compare.summarize_tape(tape, learners=2, wall_s=3.0)
+    assert summary["rounds"] == 2
+    assert summary["full_rounds"] == 1
+    assert summary["missed_grace"] == 1
+    assert summary["participation_pct"] == 75.0
+    assert summary["avg_responders"] == 1.5
+    assert summary["avg_round_ms"] == 150
+    assert summary["p95_round_ms"] == 200
+    assert summary["avg_quorum_ms"] == 30
+    assert summary["avg_grace_ms"] == 40
+    assert summary["avg_sync_ms"] == 15
+    assert summary["tokens_per_s"] == 80 / 3
+    assert summary["steps_per_s"] == 8 / 3
+    assert summary["by_node"]["0"]["responses"] == 2
+    assert summary["by_node"]["0"]["contribution_pct"] == 600 / 800 * 100
+    assert summary["by_node"]["1"]["responses"] == 1
+
+
+def test_tape_summary_handles_older_tapes(tmp_path):
+    tape = tmp_path / "old.jsonl"
+    tape.write_text(
+        '{"step":1,"fragment":0,"ms":50,"responders":['
+        '{"id":0,"c_steps":1,"c_tokens":32,"weight":1024}]}\n'
+    )
+
+    summary = compare.summarize_tape(tape, learners=2, wall_s=2.0)
+    assert summary["rounds"] == 1
+    assert summary["full_rounds"] == 0
+    assert summary["missed_grace"] == 0
+    assert summary["participation_pct"] == 50.0
+    assert summary["avg_quorum_ms"] is None
