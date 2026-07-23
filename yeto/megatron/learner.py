@@ -8,14 +8,13 @@ researched Megatron-Core / Megatron-Bridge API (see docs/MEGATRON.md) and
 needs a live multi-node B200 run to validate and iterate — exactly as the
 torch backend needed the gemma4 smokes.
 
-Scope of this first cut: TP=1, PP=1, EP=N (the natural "fill the island with
-expert parallelism" default). In that regime, with attention/dense LoRA
-targets and share_expert_adapters=True, every trainable adapter is REPLICATED
-on every rank, so the DiLoCo fragment layout is identical to the torch
-backend's and the sync reuses yeto's primitives unchanged. TP>1 (adapters
-TP-sharded) and PP>1 (adapters split across pipeline stages) need cross-
-parallel adapter gather before sync — guarded below as an explicit error
-rather than silently producing wrong merges.
+Scope: TP=1, EP=N with PP=1 for synced DiLoCo runs and PP>=1 for local
+smoke/validation runs. With attention/dense LoRA targets and
+share_expert_adapters=True, adapters are replicated across EP ranks and split
+across PP stages. The local/no-sync path gathers those PP-stage adapter
+tensors for export. Synced PP still needs a global fragment layout and
+cross-stage push/pull ownership, so it remains guarded instead of silently
+producing wrong merges.
 """
 
 from __future__ import annotations
@@ -123,12 +122,16 @@ def _init_distributed(args):
         expert_tensor_parallel_size=1,  # pure EP over experts; never split an expert tensor
     )
     model_parallel_cuda_manual_seed(args.seed)
-    if args.tensor_parallel != 1 or args.pipeline_parallel != 1:
+    if args.tensor_parallel != 1:
         raise NotImplementedError(
-            "the Megatron backend's adapter sync currently assumes TP=1, PP=1 "
-            "(adapters fully replicated per rank). TP>1 needs a TP all-gather "
-            "of linear_in/linear_out and PP>1 a cross-stage gather before the "
-            "DiLoCo push — implement those before enabling."
+            "the Megatron backend currently assumes TP=1 for adapter tensors. "
+            "TP>1 needs a TP all-gather of linear_in/linear_out before sync/export."
+        )
+    if args.pipeline_parallel != 1 and args.syncer != "none":
+        raise NotImplementedError(
+            "PP>1 is currently supported only for --syncer none validation runs. "
+            "DiLoCo sync needs a global PP fragment layout and cross-stage "
+            "push/pull ownership before it can be enabled safely."
         )
     return dist.get_rank(), dist.get_world_size(), local_rank
 
@@ -211,7 +214,7 @@ def _save_tensor_state(state, save_dir):
         return filename, "torch"
 
 
-def _save_megatron_adapter_artifact(args, model, output_dir):
+def _save_megatron_adapter_artifact(args, model, output_dir, state_override=None):
     from transformers import AutoTokenizer
 
     from ..models import resolve
@@ -220,7 +223,11 @@ def _save_megatron_adapter_artifact(args, model, output_dir):
     save_dir = os.path.expanduser(output_dir)
     os.makedirs(save_dir, exist_ok=True)
     params = _adapter_params(model)
-    state = {name: param.detach().cpu().contiguous() for name, param in params.items()}
+    state = (
+        {name: tensor.detach().cpu().contiguous() for name, tensor in state_override.items()}
+        if state_override is not None
+        else {name: param.detach().cpu().contiguous() for name, param in params.items()}
+    )
     weights_file, weights_format = _save_tensor_state(state, save_dir)
 
     targets = list(_ATTENTION_TARGETS)
@@ -245,6 +252,9 @@ def _save_megatron_adapter_artifact(args, model, output_dir):
             "tensor": args.tensor_parallel,
             "pipeline": args.pipeline_parallel,
         },
+        "export": {
+            "pipeline_stage_gathered": bool(args.pipeline_parallel != 1 and state_override is not None),
+        },
         "parameter_names": sorted(state),
     }
     with open(os.path.join(save_dir, MEGATRON_ADAPTER_METADATA_FILE), "w") as handle:
@@ -263,12 +273,77 @@ def _save_megatron_adapter_artifact(args, model, output_dir):
     return True
 
 
-def _save_output_best_effort(bridge, model, output_dir, args=None):
+def _parallel_rank(getter_name, default=0):
+    try:
+        from megatron.core import parallel_state
+
+        getter = getattr(parallel_state, getter_name, None)
+        if getter is None:
+            return default
+        return int(getter())
+    except Exception:
+        return default
+
+
+def _adapter_state_for_export(model):
+    return {name: param.detach().cpu().contiguous() for name, param in _adapter_params(model).items()}
+
+
+def _gather_adapter_state_for_export(args, model, rank, world):
+    """Return the canonical adapter state on rank 0.
+
+    PP stages own disjoint layer ranges, while attention LoRA is replicated
+    across EP ranks when share_expert_adapters=True. For local validation runs,
+    gather one representative EP/TP rank per PP stage onto rank 0 for the final
+    Yeto adapter artifact. Synced PP runs are still guarded in _init_distributed.
+    """
+    if args.pipeline_parallel == 1 or world == 1:
+        return _adapter_state_for_export(model) if rank == 0 else None
+
+    import torch.distributed as dist
+
+    tp_rank = _parallel_rank("get_tensor_model_parallel_rank")
+    ep_rank = _parallel_rank("get_expert_model_parallel_rank")
+    pp_rank = _parallel_rank("get_pipeline_model_parallel_rank")
+    payload = None
+    if tp_rank == 0 and ep_rank == 0:
+        payload = {
+            "pipeline_rank": pp_rank,
+            "state": _adapter_state_for_export(model),
+        }
+
+    gathered = [None] * world
+    dist.all_gather_object(gathered, payload)
+    if rank != 0:
+        return None
+
+    merged = {}
+    seen_pp = set()
+    for item in gathered:
+        if not item:
+            continue
+        pp_rank = item["pipeline_rank"]
+        if pp_rank in seen_pp:
+            continue
+        seen_pp.add(pp_rank)
+        for name, tensor in item["state"].items():
+            if name in merged:
+                raise RuntimeError(f"duplicate Megatron adapter tensor during PP export: {name}")
+            merged[name] = tensor
+    if len(seen_pp) != args.pipeline_parallel:
+        raise RuntimeError(
+            "could not gather one adapter shard from every PP stage for export "
+            f"(got {sorted(seen_pp)}, expected {args.pipeline_parallel} stages)"
+        )
+    return merged
+
+
+def _save_output_best_effort(bridge, model, output_dir, args=None, state_override=None):
     save_dir = os.path.expanduser(output_dir)
     os.makedirs(save_dir, exist_ok=True)
     if args is not None and args.tuning == "lora":
         log.info("writing Yeto Megatron adapter artifact without Bridge HF export")
-        return _save_megatron_adapter_artifact(args, model, save_dir)
+        return _save_megatron_adapter_artifact(args, model, save_dir, state_override=state_override)
 
     bridge_tmp = os.path.join(save_dir, ".bridge-export-tmp")
     shutil.rmtree(bridge_tmp, ignore_errors=True)
@@ -390,12 +465,17 @@ def main(argv=None):
         bulk_dtype=bulk_dtype, DTYPE_Q4=DTYPE_Q4,
     )
 
-    # Avoid collectives in the shutdown/save path. Megatron's distributed
-    # optimizer may still have bookkeeping collectives in flight on some
-    # versions, and an extra barrier here can trip NCCL's watchdog after the
-    # tiny validation loop. Rank 0 saves the replicated adapter artifact.
+    # Avoid barriers in the shutdown/save path. For PP local validation, gather
+    # one adapter shard per pipeline stage, then rank 0 writes the artifact.
+    export_state = _gather_adapter_state_for_export(args, model, rank, world)
     if rank == 0:
-        saved = _save_output_best_effort(bridge, model, args.output_dir, args)
+        saved = _save_output_best_effort(
+            bridge,
+            model,
+            args.output_dir,
+            args,
+            state_override=export_state,
+        )
         if saved:
             from ..provenance import write_provenance_manifest
 

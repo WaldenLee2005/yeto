@@ -212,6 +212,86 @@ def test_save_output_best_effort_writes_megatron_adapter_for_lora(tmp_path, monk
     assert (tmp_path / "tokenizer_config.json").exists()
 
 
+def test_save_output_best_effort_uses_pipeline_gathered_state(tmp_path, monkeypatch):
+    class BridgeShouldNotRun:
+        def save_hf_pretrained(self, model, save_dir):
+            raise AssertionError("Bridge export should be skipped for Megatron LoRA")
+
+    class FakeTokenizer:
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            return cls()
+
+        def save_pretrained(self, save_dir):
+            Path(save_dir, "tokenizer_config.json").write_text("{}")
+
+    class LocalStageOnly:
+        def named_parameters(self):
+            return []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoTokenizer=FakeTokenizer),
+    )
+    monkeypatch.setattr("yeto.models.resolve", lambda model: f"resolved/{model}")
+
+    args = SimpleNamespace(
+        model="m",
+        model_revision=None,
+        trust_remote_code=True,
+        tuning="lora",
+        lora_targets="attention",
+        lora_r=8,
+        lora_alpha=16,
+        expert_parallel=8,
+        tensor_parallel=1,
+        pipeline_parallel=2,
+    )
+    state = {
+        "decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight": torch.ones(1),
+        "decoder.layers.40.self_attention.linear_qkv.adapter.linear_in.weight": torch.ones(1) * 2,
+    }
+
+    assert ml._save_output_best_effort(
+        BridgeShouldNotRun(),
+        [LocalStageOnly()],
+        tmp_path,
+        args,
+        state_override=state,
+    )
+
+    meta = json.loads((tmp_path / ml.MEGATRON_ADAPTER_METADATA_FILE).read_text())
+    assert meta["export"] == {"pipeline_stage_gathered": True}
+    assert meta["parallelism"]["pipeline"] == 2
+    assert meta["parameter_names"] == sorted(state)
+
+
+def test_gather_adapter_state_for_export_merges_one_replica_per_pipeline_stage(monkeypatch):
+    import torch.distributed as dist
+
+    stage0 = {"decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight": torch.ones(1)}
+    stage1 = {"decoder.layers.40.self_attention.linear_proj.adapter.linear_in.weight": torch.ones(1) * 2}
+
+    def fake_all_gather_object(out, payload):
+        assert payload["pipeline_rank"] == 0
+        out[:] = [
+            {"pipeline_rank": 0, "state": stage0},
+            None,
+            {"pipeline_rank": 1, "state": stage1},
+            None,
+        ]
+
+    monkeypatch.setattr(ml, "_parallel_rank", lambda name, default=0: 0)
+    monkeypatch.setattr(ml, "_adapter_state_for_export", lambda model: stage0)
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+
+    args = SimpleNamespace(pipeline_parallel=2)
+    merged = ml._gather_adapter_state_for_export(args, ["model"], rank=0, world=4)
+
+    assert merged == {**stage0, **stage1}
+
+
 def test_save_output_best_effort_drops_partial_bridge_export_for_full_tuning(tmp_path):
     class PartialBridge:
         def save_hf_pretrained(self, model, save_dir):
