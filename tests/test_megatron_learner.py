@@ -48,6 +48,18 @@ def test_attention_targets_are_megatron_names_not_hf():
     assert ml._MLP_TARGETS == ["linear_fc1", "linear_fc2"]
 
 
+def test_configure_runtime_config_sets_pp_dtype_and_ds4_loss_default():
+    cfg = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid",
+        dsa_indexer_loss_coeff=None,
+    )
+
+    ml._configure_runtime_config(cfg)
+
+    assert cfg.pipeline_dtype is torch.bfloat16
+    assert cfg.dsa_indexer_loss_coeff == 0.0
+
+
 def test_build_model_disables_bridge_ddp_and_uses_lora_signature(monkeypatch):
     seen = {}
 

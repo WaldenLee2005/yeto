@@ -47,6 +47,15 @@ _ATTENTION_TARGETS = [
 _MLP_TARGETS = ["linear_fc1", "linear_fc2"]
 
 
+def _configure_runtime_config(cfg):
+    import torch
+
+    cfg.pipeline_dtype = torch.bfloat16
+    if getattr(cfg, "experimental_attention_variant", None) == "dsv4_hybrid":
+        if getattr(cfg, "dsa_indexer_loss_coeff", None) is None:
+            cfg.dsa_indexer_loss_coeff = 0.0
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser("yeto.megatron.learner")
     p.add_argument("--model", required=True)
@@ -448,7 +457,7 @@ def main(argv=None):
     )
     cfg = getattr(model[0], "config", None) or getattr(getattr(model[0], "module", None), "config")
     cfg.finalize_model_grads_func = finalize_model_grads
-    cfg.pipeline_dtype = torch.bfloat16
+    _configure_runtime_config(cfg)
     model = [DDP(config=cfg, ddp_config=ddp_cfg, module=m) for m in model]
     opt = get_megatron_optimizer(
         config=OptimizerConfig(
