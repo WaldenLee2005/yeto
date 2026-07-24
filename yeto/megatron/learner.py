@@ -194,6 +194,23 @@ def _adapter_params(model):
     return out
 
 
+def _load_hf_tokenizer(factory, model_id: str, *, load_kwargs: dict, offline_first=None):
+    """Load tokenizer normally, then fall back to the slow tokenizer."""
+    kwargs = dict(load_kwargs)
+    try:
+        if offline_first is not None:
+            return offline_first(factory, model_id, **kwargs)
+        return factory.from_pretrained(model_id, **kwargs)
+    except ValueError as exc:
+        if "Couldn't instantiate the backend tokenizer" not in str(exc):
+            raise
+        kwargs["use_fast"] = False
+        log.warning("fast tokenizer load failed for %s; retrying with use_fast=False", model_id)
+        if offline_first is not None:
+            return offline_first(factory, model_id, **kwargs)
+        return factory.from_pretrained(model_id, **kwargs)
+
+
 def _save_tensor_state(state, save_dir):
     try:
         from safetensors.torch import save_file
@@ -261,9 +278,10 @@ def _save_megatron_adapter_artifact(args, model, output_dir, state_override=None
         json.dump(metadata, handle, indent=2)
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = _load_hf_tokenizer(
+            AutoTokenizer,
             base_model,
-            **model_load_kwargs(args),
+            load_kwargs=model_load_kwargs(args),
         )
         tokenizer.save_pretrained(save_dir)
     except Exception as exc:
@@ -648,10 +666,11 @@ def _load_tokenizer(args):
     from ..models import resolve
     from ..provenance import model_load_kwargs
 
-    return _from_pretrained_offline_first(
+    return _load_hf_tokenizer(
         AutoTokenizer,
         resolve(args.model),
-        **model_load_kwargs(args),
+        load_kwargs=model_load_kwargs(args),
+        offline_first=_from_pretrained_offline_first,
     )
 
 
