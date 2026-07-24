@@ -423,3 +423,135 @@ def test_inner_loop_uses_schedule_signature_supported_by_megatron(monkeypatch):
     )
 
     assert "pipeline_dtype" not in calls[0]
+
+
+def test_inner_loop_omits_input_ids_on_non_first_pipeline_stage(monkeypatch):
+    monkeypatch.setattr(ml, "_load_tokenizer", lambda args: "tok")
+    monkeypatch.setattr(
+        ml,
+        "_packed_blocks",
+        lambda args, tokenizer: [(torch.tensor([1, 2, 3]), torch.ones(3))],
+    )
+    monkeypatch.setattr(ml, "_pipeline_stage_roles", lambda: (False, True))
+
+    seen = {}
+
+    class FakeModel:
+        def zero_grad_buffer(self):
+            pass
+
+        def __call__(self, **kwargs):
+            seen.update(kwargs)
+            return torch.ones(3)
+
+    class FakeOpt:
+        def zero_grad(self):
+            pass
+
+        def step(self):
+            pass
+
+    def fake_forward_backward(**kwargs):
+        out, loss_func = kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
+        loss, loss_dict = loss_func(out)
+        seen["loss"] = loss
+        seen["loss_dict"] = loss_dict
+
+    args = SimpleNamespace(
+        micro_batch_size=1,
+        max_local_steps=1,
+        grad_accum=1,
+        seq_len=3,
+        merge_alpha=0,
+        output_dir="unused",
+    )
+    layout = SimpleNamespace(num_fragments=0, fragments=[])
+
+    ml._run_inner_loop(
+        args,
+        [FakeModel()],
+        {},
+        layout,
+        FakeOpt(),
+        fake_forward_backward,
+        client=None,
+        rank=0,
+        world=1,
+        device=torch.device("cpu"),
+        fragment_flat=None,
+        pack_tensor=None,
+        quantize_q4=None,
+        unpack_fragment=None,
+        apply_fragment=None,
+        bulk_dtype=None,
+        DTYPE_Q4=object(),
+    )
+
+    assert seen["input_ids"] is None
+    assert seen["labels"].tolist() == [[2, 3, 0]]
+    assert seen["position_ids"].tolist() == [[0, 1, 2]]
+    assert seen["loss"].item() == 1.0
+
+
+def test_inner_loop_omits_labels_on_non_last_pipeline_stage(monkeypatch):
+    monkeypatch.setattr(ml, "_load_tokenizer", lambda args: "tok")
+    monkeypatch.setattr(
+        ml,
+        "_packed_blocks",
+        lambda args, tokenizer: [(torch.tensor([1, 2, 3]), torch.ones(3))],
+    )
+    monkeypatch.setattr(ml, "_pipeline_stage_roles", lambda: (True, False))
+
+    seen = {}
+
+    class FakeModel:
+        def zero_grad_buffer(self):
+            pass
+
+        def __call__(self, **kwargs):
+            seen.update(kwargs)
+            return torch.ones(1)
+
+    class FakeOpt:
+        def zero_grad(self):
+            pass
+
+        def step(self):
+            pass
+
+    def fake_forward_backward(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"][0])
+
+    args = SimpleNamespace(
+        micro_batch_size=1,
+        max_local_steps=1,
+        grad_accum=1,
+        seq_len=3,
+        merge_alpha=0,
+        output_dir="unused",
+    )
+    layout = SimpleNamespace(num_fragments=0, fragments=[])
+
+    ml._run_inner_loop(
+        args,
+        [FakeModel()],
+        {},
+        layout,
+        FakeOpt(),
+        fake_forward_backward,
+        client=None,
+        rank=0,
+        world=1,
+        device=torch.device("cpu"),
+        fragment_flat=None,
+        pack_tensor=None,
+        quantize_q4=None,
+        unpack_fragment=None,
+        apply_fragment=None,
+        bulk_dtype=None,
+        DTYPE_Q4=object(),
+    )
+
+    assert seen["input_ids"].tolist() == [[1, 2, 3]]
+    assert seen["labels"] is None
+    assert seen["position_ids"].tolist() == [[0, 1, 2]]

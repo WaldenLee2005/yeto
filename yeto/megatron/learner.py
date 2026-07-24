@@ -56,6 +56,18 @@ def _configure_runtime_config(cfg):
             cfg.dsa_indexer_loss_coeff = 0.0
 
 
+def _pipeline_stage_roles():
+    try:
+        from megatron.core import parallel_state
+    except Exception:
+        return True, True
+
+    return (
+        parallel_state.is_pipeline_first_stage(),
+        parallel_state.is_pipeline_last_stage(),
+    )
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser("yeto.megatron.learner")
     p.add_argument("--model", required=True)
@@ -534,13 +546,16 @@ def _run_inner_loop(
     tokenizer = _load_tokenizer(args)
     dataset = _packed_blocks(args, tokenizer)
     data_iter = _cycle(dataset, micro_batch_size=mbs)
+    is_pp_first_stage, is_pp_last_stage = _pipeline_stage_roles()
 
     def forward_step(it, mdl):
         batch = next(it)
-        ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        loss_mask = batch["loss_mask"].to(device)
-        pos = torch.arange(ids.size(1), device=device).unsqueeze(0).expand_as(ids)
+        batch_size = batch["input_ids"].size(0)
+        seq_len = batch["input_ids"].size(1)
+        ids = batch["input_ids"].to(device) if is_pp_first_stage else None
+        labels = batch["labels"].to(device) if is_pp_last_stage else None
+        loss_mask = batch["loss_mask"].to(device) if is_pp_last_stage else None
+        pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
         out = mdl(input_ids=ids, position_ids=pos, attention_mask=None, labels=labels)
 
         def loss_func(output):
