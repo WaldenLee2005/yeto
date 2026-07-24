@@ -569,6 +569,7 @@ def _run_inner_loop(
             seq_length=args.seq_len,
             micro_batch_size=mbs,
             forward_only=False,
+            pipeline_dtype=torch.bfloat16,
         )
         opt.step()  # grads reduced across DP/EP inside finalize_model_grads
         steps_total += 1

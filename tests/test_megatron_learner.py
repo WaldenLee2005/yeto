@@ -358,3 +358,56 @@ def test_streaming_data_path_keeps_ep_ranks_on_the_same_tokens(monkeypatch):
         "train_on": "assistant",
         "assistant_mask_mode": "native",
     }
+
+
+def test_inner_loop_passes_pipeline_dtype_for_pp_schedule(monkeypatch):
+    monkeypatch.setattr(ml, "_load_tokenizer", lambda args: "tok")
+    monkeypatch.setattr(ml, "_packed_blocks", lambda args, tokenizer: [torch.tensor([1, 2, 3])])
+
+    calls = []
+
+    def fake_forward_backward(**kwargs):
+        calls.append(kwargs)
+
+    class FakeModel:
+        def zero_grad_buffer(self):
+            pass
+
+    class FakeOpt:
+        def zero_grad(self):
+            pass
+
+        def step(self):
+            pass
+
+    args = SimpleNamespace(
+        micro_batch_size=1,
+        max_local_steps=1,
+        grad_accum=1,
+        seq_len=3,
+        merge_alpha=0,
+        output_dir="unused",
+    )
+    layout = SimpleNamespace(num_fragments=0, fragments=[])
+
+    ml._run_inner_loop(
+        args,
+        [FakeModel()],
+        {},
+        layout,
+        FakeOpt(),
+        fake_forward_backward,
+        client=None,
+        rank=0,
+        world=1,
+        device=torch.device("cpu"),
+        fragment_flat=None,
+        pack_tensor=None,
+        quantize_q4=None,
+        unpack_fragment=None,
+        apply_fragment=None,
+        bulk_dtype=None,
+        DTYPE_Q4=object(),
+    )
+
+    assert calls[0]["pipeline_dtype"] is torch.bfloat16
