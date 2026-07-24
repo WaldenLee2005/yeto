@@ -448,6 +448,7 @@ def main(argv=None):
     )
     cfg = getattr(model[0], "config", None) or getattr(getattr(model[0], "module", None), "config")
     cfg.finalize_model_grads_func = finalize_model_grads
+    cfg.pipeline_dtype = torch.bfloat16
     model = [DDP(config=cfg, ddp_config=ddp_cfg, module=m) for m in model]
     opt = get_megatron_optimizer(
         config=OptimizerConfig(
@@ -569,7 +570,6 @@ def _run_inner_loop(
             seq_length=args.seq_len,
             micro_batch_size=mbs,
             forward_only=False,
-            pipeline_dtype=torch.bfloat16,
         )
         opt.step()  # grads reduced across DP/EP inside finalize_model_grads
         steps_total += 1

@@ -360,7 +360,7 @@ def test_streaming_data_path_keeps_ep_ranks_on_the_same_tokens(monkeypatch):
     }
 
 
-def test_inner_loop_passes_pipeline_dtype_for_pp_schedule(monkeypatch):
+def test_inner_loop_uses_schedule_signature_supported_by_megatron(monkeypatch):
     monkeypatch.setattr(ml, "_load_tokenizer", lambda args: "tok")
     monkeypatch.setattr(ml, "_packed_blocks", lambda args, tokenizer: [torch.tensor([1, 2, 3])])
 
@@ -410,4 +410,4 @@ def test_inner_loop_passes_pipeline_dtype_for_pp_schedule(monkeypatch):
         DTYPE_Q4=object(),
     )
 
-    assert calls[0]["pipeline_dtype"] is torch.bfloat16
+    assert "pipeline_dtype" not in calls[0]
