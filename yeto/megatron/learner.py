@@ -367,7 +367,12 @@ def _gather_adapter_state_for_export(args, model, rank, world):
         seen_pp.add(pp_rank)
         for name, tensor in item["state"].items():
             if name in merged:
-                raise RuntimeError(f"duplicate Megatron adapter tensor during PP export: {name}")
+                if tuple(merged[name].shape) != tuple(tensor.shape):
+                    raise RuntimeError(
+                        "duplicate Megatron adapter tensor with mismatched shape during PP export: "
+                        f"{name}: {tuple(merged[name].shape)} vs {tuple(tensor.shape)}"
+                    )
+                continue
             merged[name] = tensor
     if len(seen_pp) != args.pipeline_parallel:
         raise RuntimeError(

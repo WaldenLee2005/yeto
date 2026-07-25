@@ -304,6 +304,28 @@ def test_gather_adapter_state_for_export_merges_one_replica_per_pipeline_stage(m
     assert merged == {**stage0, **stage1}
 
 
+def test_gather_adapter_state_for_export_deduplicates_replicated_pipeline_tensors(monkeypatch):
+    import torch.distributed as dist
+
+    shared = {"decoder.layers.0.self_attention.linear_proj.adapter.linear_in.weight": torch.ones(1)}
+
+    def fake_all_gather_object(out, payload):
+        assert payload["pipeline_rank"] == 0
+        out[:] = [
+            {"pipeline_rank": 0, "state": shared},
+            {"pipeline_rank": 1, "state": shared},
+        ]
+
+    monkeypatch.setattr(ml, "_parallel_rank", lambda name, default=0: 0)
+    monkeypatch.setattr(ml, "_adapter_state_for_export", lambda model: shared)
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+
+    args = SimpleNamespace(pipeline_parallel=2)
+    merged = ml._gather_adapter_state_for_export(args, ["model"], rank=0, world=2)
+
+    assert merged == shared
+
+
 def test_save_output_best_effort_drops_partial_bridge_export_for_full_tuning(tmp_path):
     class PartialBridge:
         def save_hf_pretrained(self, model, save_dir):
